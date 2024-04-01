@@ -1,0 +1,235 @@
+---
+title: "One-Year Predictions: Logistic Regression"
+output: html_document
+date: "2024-03-11"
+---
+
+Notes
+- Figure out how to deal with annual review ratings
+- Figure out how to encode potential
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+Import packages:
+```{r}
+library(tidyverse)
+library(caret)
+library(mlbench)
+library(glmnet)
+library(reshape2)
+library(ROCR)
+source("../utils.R")
+set.seed(42)
+```
+
+Load data:
+```{r}
+df <- read_csv("../data/agg_one_year.csv")
+```
+
+The dependent variable for this analysis is `vol_attrition_next_year`. This is a binary indicator for whether the employee quit in the following year. In the dataset, there are about 19,000 cases where this value is `NA`. These values represent three separate cases: (1) the year of the record was in 2023, so we do not have data for the following year; (2) the employee terminated in that year, so they could not have quit in the following year; or (3) the employee retired in the following year, and we have removed retirements from analysis.
+
+Something else I am filtering out is cases when vol_attrition_next_year == 1 and attrition == 1. This would indicate that the employee is quitting in this year and next year, so they must have been rehired between quits. There are 181 cases of this.
+
+Data cleaning:
+```{r}
+# Prepare data and input which features to not use:
+data <- prepare_data_for_regression(
+  df,
+  exclude_cols = c("cost_centre",
+                   "elt",
+                   "continent",
+                   "number_of_direct_and_indirect_reports_norm")
+)
+```
+
+Prepare data for model training:
+```{r}
+split <- split_data(data)
+train_data <- split[[1]]
+validate_data <- split[[2]]
+test_data <- split[[3]]
+```
+
+Lasso regression:
+```{r}
+# Get numeric column names:
+num_features <- colnames(data)[sapply(data, is.numeric)]
+# Remove vol_attrition_next_year:
+num_features <- num_features[-length(num_features)]
+# Get categorical column names:
+cat_features <- names(data)[sapply(data, is.factor)]
+
+X_y_split <- get_X_y(train_data, cat_features, num_features)
+X_train <- X_y_split[[1]]
+y_train <- X_y_split[[2]]
+# Define class weights
+class_weights <- ifelse(y_train == 0, 1, sum(y_train == 0) / sum(y_train == 1))
+```
+
+```{r}
+# Check if classes of columns are right and check for NAs:
+for (col in colnames(X_train)) {
+  if (class(X_train[[col]]) != "numeric") {
+    print(col)
+    print(class(X_train[[col]]))
+  }
+  if (sum(is.na(X_train[[col]]) > 0)) {
+    print(col)
+    print(sum(is.na(X_train[[col]])))
+  }
+}
+```
+
+Train LASSO model:
+```{r}
+net_fit <- glmnet(X_train,
+                  y_train,
+                  family = "binomial",
+                  alpha = 1,
+                  weights = class_weights)
+plot(net_fit, label = TRUE)
+```
+
+```{r}
+colnames(X_train)[344]
+```
+
+```{r}
+print(net_fit)
+```
+
+Look at coefficients of model:
+```{r}
+lambda <- 0.005665182 # best lambda value from cross-validation
+coefs <- coef(net_fit, s = lambda)
+# Arrange coefficients by descending size:
+as.data.frame(as.matrix(coefs)) %>% arrange(desc(abs(s1)))
+```
+
+Evaluate on validate set:
+```{r}
+split_data <- get_X_y(validate_data, cat_features, num_features)
+X_validate <- split_data[[1]]
+y_validate <- as.numeric(as.vector(split_data[[2]]))
+# Get predictions:
+y_probs <- predict(net_fit,
+                   newx = as.matrix(X_validate),
+                   type = "response",
+                   s = lambda)
+evaluate_class_model(y_probs, y_validate)
+```
+
+## Cross-validated model:
+
+```{r}
+# # Train model (takes about 4 minutes):
+# cv_fit <- cv.glmnet(as.matrix(X_train),
+#                     y_train,
+#                     family = "binomial",
+#                     type.measure = "class",
+#                     weights = class_weights)
+# # Save model:
+# saveRDS(cv_fit, "models/regressions/cv_model_nocc_noelt.rds")
+
+# Load cv model if already trained:
+cv_fit <- readRDS("models/regressions/cv_model_nocc_noelt.rds")
+plot(cv_fit)
+```
+The two vertical dotted lines are the following values:
+```{r}
+print(log(cv_fit$lambda.min))
+print(log(cv_fit$lambda.1se))
+```
+
+Evaluate model:
+```{r}
+split_data <- get_X_y(validate_data, cat_features, num_features)
+X_validate <- split_data[[1]]
+y_validate <- as.numeric(as.vector(split_data[[2]]))
+y_probs <- predict(cv_fit,
+                   newx = as.matrix(X_validate),
+                   type = "response")
+evaluate_class_model(y_probs, y_validate)
+```
+
+$Precision=\frac{TP}{TP+FP} = \frac{416}{416+2962}=0.12$
+$Recall=\frac{TP}{TP+FN}=\frac{416}{416+93}=0.82$
+$F1=\frac{2*Precision*Recall}{Precision+Recall}=0.21$
+
+```{r}
+coefs <- coef(cv_fit)
+# Arrange coefficients by descending size:
+as.data.frame(as.matrix(coefs)) %>% arrange(desc(abs(s1)))
+```
+
+Check distribution of prediction error (gives weird results because the data is imbalanced):
+```{r}
+cv_fit_residuals <- resid(cv_fit, "response")
+cv_fit_residuals
+prediction_errors <- y_validate - y_probs
+hist(prediction_errors)
+```
+
+## Logistic regression on to predictors from all models to get significance:
+
+```{r}
+vars_to_include <- c("is_active_union_member", "management_level_encoded_norm",
+                     "zone_encoded_norm", "grade_grouping_encoded_norm",
+                     "number_of_direct_reports_norm",
+                     "reporting_hierarchy_level_norm", "position_in_range_norm",
+                     "tenure_norm", "time_in_job_profile_norm", "age_norm",
+                     "genderMale")
+X_train_logit <- X_train[, vars_to_include]
+```
+
+Examine multicollinearity:
+```{r}
+cors <- cor(X_train_logit)
+melted_cors <- melt(cors)
+ggplot(melted_cors, mapping = aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "black") +
+  scale_fill_gradient2(limits = c(-1, 1), 
+                       low = "#850000",
+                       mid = "white",
+                       high = "#e9aa03") +
+  theme(axis.text.x = element_text(angle = 15))
+```
+
+Highly positively correlated variables:
+Zone and position in range (0.87)
+Position in range and management level (0.51)
+Tenure and time in job profile (0.66)
+Tenure and age (0.63)
+
+Negatively correlated: 
+Management level and grade grouping (-0.65)
+Management level and reporting hierarchy level (-0.60)
+Grade grouping and position in range (-0.50)
+
+Take out management level, position in range, tenure (for now):
+
+```{r}
+X_train_logit <- select(X_train_logit,
+                        -tenure_norm,
+                        -management_level_encoded_norm,
+                        -position_in_range_norm)
+fit <- glm(y_train ~ ., 
+           data = cbind(X_train_logit, y_train),
+           family = "binomial",
+           weights = class_weights)
+# Save model:
+saveRDS(fit, "models/regressions/stat_logistic.rds")
+summary(fit)
+```
+
+```{r}
+data %>%
+  group_by(number_of_direct_reports_norm > 0) %>%
+  summarize(count = n(), 
+            num_quit = sum(vol_attrition_next_year))
+```
+
