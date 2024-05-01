@@ -1,12 +1,8 @@
 ---
 title: "One-Year Predictions: Logistic Regression"
 output: html_document
-date: "2024-03-11"
+date: "2024-05-01"
 ---
-
-Notes
-- Figure out how to deal with annual review ratings
-- Figure out how to encode potential
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE)
@@ -19,21 +15,39 @@ library(caret)
 library(mlbench)
 library(glmnet)
 library(reshape2)
-library(ROCR)
-source("../utils.R")
+library(here)
+source(here("utils.R"))
 set.seed(42)
 ```
 
 Load data:
 ```{r}
-df <- read_csv("../data/agg_one_year.csv")
+suppressMessages({
+  df <- read_csv(here("data", "agg_one_year.csv"))
+})
 ```
 
 The dependent variable for this analysis is `vol_attrition_next_year`. This is a binary indicator for whether the employee quit in the following year. In the dataset, there are about 19,000 cases where this value is `NA`. These values represent three separate cases: (1) the year of the record was in 2023, so we do not have data for the following year; (2) the employee terminated in that year, so they could not have quit in the following year; or (3) the employee retired in the following year, and we have removed retirements from analysis.
 
 Something else I am filtering out is cases when vol_attrition_next_year == 1 and attrition == 1. This would indicate that the employee is quitting in this year and next year, so they must have been rehired between quits. There are 181 cases of this.
 
-Data cleaning:
+## Full Model
+
+### Data cleaning
+
+I am removing the following variables from the model:
+- Cost center (too granular)
+- ELT (not informative)
+- Continent (redundant because I am including country)
+- Number of direct reports (mistrusted feature)
+- Company (too granular)
+- Management level (correlated with grade grouping)
+- Potential (too many NA values)
+- Annual review rating (too many NA values)
+- Zone (highly correlated with position in range)
+- Age (correlated with tenure, created a new variable age / tenure)
+- Time in job profile (correlated with tenure, created a new variable tijp / tenure)
+
 ```{r}
 # Prepare data and input which features to not use:
 data <- prepare_data_for_regression(
@@ -41,19 +55,34 @@ data <- prepare_data_for_regression(
   exclude_cols = c("cost_centre",
                    "elt",
                    "continent",
-                   "number_of_direct_and_indirect_reports_norm")
+                   "number_of_direct_reports_norm",
+                   "company",
+                   "management_level_encoded_norm",
+                   "potential_encoded_norm",
+                   "annual_review_encoded_norm",
+                   "zone_encoded_norm",
+                   "age_norm",
+                   "time_in_job_profile_norm",
+                   "tenure_norm",
+                   "age_over_tenure_norm",
+                   "reporting_hierarchy_level_norm",
+                   "rhl_squared_norm",
+                   "grade_grouping_encoded_norm")
 )
 ```
 
 Prepare data for model training:
 ```{r}
+set.seed(42)
 split <- split_data(data)
 train_data <- split[[1]]
 validate_data <- split[[2]]
 test_data <- split[[3]]
+# Combine train data and validate data together (no need for 3 groups):
+train_data <- rbind(train_data, validate_data)
 ```
 
-Lasso regression:
+Get column names of numeric and categorical features:
 ```{r}
 # Get numeric column names:
 num_features <- colnames(data)[sapply(data, is.numeric)]
@@ -61,175 +90,163 @@ num_features <- colnames(data)[sapply(data, is.numeric)]
 num_features <- num_features[-length(num_features)]
 # Get categorical column names:
 cat_features <- names(data)[sapply(data, is.factor)]
+```
 
+### Model Training
+
+Train cross-validated lasso regression (skip if already trained):
+```{r}
+# Separate X and y:
 X_y_split <- get_X_y(train_data, cat_features, num_features)
 X_train <- X_y_split[[1]]
 y_train <- X_y_split[[2]]
-# Define class weights
+# Define class weights to handle imbalanced labels
+# - Optional to use
+# - If using, add the argument `weights = class_weights`
 class_weights <- ifelse(y_train == 0, 1, sum(y_train == 0) / sum(y_train == 1))
+
+# Train model (takes 2-4 minutes):
+cv_fit <- cv.glmnet(as.matrix(X_train),
+                    y_train,
+                    family = "binomial",
+                    type.measure = "class")
+
+# Save model:
+saveRDS(cv_fit, here("one_year_predictions",
+                     "models",
+                     "regressions",
+                     "cv_model_v6.rds"))
 ```
 
+Load the model if it has already been trained:
 ```{r}
-# Check if classes of columns are right and check for NAs:
-for (col in colnames(X_train)) {
-  if (class(X_train[[col]]) != "numeric") {
-    print(col)
-    print(class(X_train[[col]]))
-  }
-  if (sum(is.na(X_train[[col]]) > 0)) {
-    print(col)
-    print(sum(is.na(X_train[[col]])))
-  }
-}
-```
-
-Train LASSO model:
-```{r}
-net_fit <- glmnet(X_train,
-                  y_train,
-                  family = "binomial",
-                  alpha = 1,
-                  weights = class_weights)
-plot(net_fit, label = TRUE)
-```
-
-```{r}
-colnames(X_train)[344]
-```
-
-```{r}
-print(net_fit)
-```
-
-Look at coefficients of model:
-```{r}
-lambda <- 0.005665182 # best lambda value from cross-validation
-coefs <- coef(net_fit, s = lambda)
-# Arrange coefficients by descending size:
-as.data.frame(as.matrix(coefs)) %>% arrange(desc(abs(s1)))
-```
-
-Evaluate on validate set:
-```{r}
-split_data <- get_X_y(validate_data, cat_features, num_features)
-X_validate <- split_data[[1]]
-y_validate <- as.numeric(as.vector(split_data[[2]]))
-# Get predictions:
-y_probs <- predict(net_fit,
-                   newx = as.matrix(X_validate),
-                   type = "response",
-                   s = lambda)
-evaluate_class_model(y_probs, y_validate)
-```
-
-## Cross-validated model:
-
-```{r}
-# # Train model (takes about 4 minutes):
-# cv_fit <- cv.glmnet(as.matrix(X_train),
-#                     y_train,
-#                     family = "binomial",
-#                     type.measure = "class",
-#                     weights = class_weights)
-# # Save model:
-# saveRDS(cv_fit, "models/regressions/cv_model_nocc_noelt.rds")
-
-# Load cv model if already trained:
-cv_fit <- readRDS("models/regressions/cv_model_nocc_noelt.rds")
+cv_fit <- readRDS(here("one_year_predictions",
+                       "models",
+                       "regressions",
+                       "cv_model_v6.rds"))
 plot(cv_fit)
 ```
-The two vertical dotted lines are the following values:
+
 ```{r}
-print(log(cv_fit$lambda.min))
-print(log(cv_fit$lambda.1se))
+print(cv_fit$lambda.min)
+print(cv_fit$lambda.1se)
 ```
 
-Evaluate model:
+### Model Evaluation
+
 ```{r}
-split_data <- get_X_y(validate_data, cat_features, num_features)
-X_validate <- split_data[[1]]
-y_validate <- as.numeric(as.vector(split_data[[2]]))
+lambda = 0.005
+X_y <- get_X_y(test_data, cat_features, num_features)
+X_test <- X_y[[1]]
+y_test <- as.numeric(as.vector(X_y[[2]]))
 y_probs <- predict(cv_fit,
-                   newx = as.matrix(X_validate),
+                   s = lambda,
+                   newx = as.matrix(X_test),
                    type = "response")
-evaluate_class_model(y_probs, y_validate)
+file_path <- here("data_visualization", "plots", "lasso_v6_roc.pdf")
+evaluate_class_model(y_probs, y_test, threshold = 0.05, file_path)
 ```
 
-$Precision=\frac{TP}{TP+FP} = \frac{416}{416+2962}=0.12$
-$Recall=\frac{TP}{TP+FN}=\frac{416}{416+93}=0.82$
-$F1=\frac{2*Precision*Recall}{Precision+Recall}=0.21$
+### Most Significant Predictors
 
 ```{r}
-coefs <- coef(cv_fit)
+# Choose complexity penalty:
+lambda = 0.005
+coefs <- coef(cv_fit, s = lambda)
 # Arrange coefficients by descending size:
 as.data.frame(as.matrix(coefs)) %>% arrange(desc(abs(s1)))
 ```
 
-Check distribution of prediction error (gives weird results because the data is imbalanced):
-```{r}
-cv_fit_residuals <- resid(cv_fit, "response")
-cv_fit_residuals
-prediction_errors <- y_validate - y_probs
-hist(prediction_errors)
-```
-
-## Logistic regression on to predictors from all models to get significance:
+### Make evaluations table:
 
 ```{r}
-vars_to_include <- c("is_active_union_member", "management_level_encoded_norm",
-                     "zone_encoded_norm", "grade_grouping_encoded_norm",
-                     "number_of_direct_reports_norm",
-                     "reporting_hierarchy_level_norm", "position_in_range_norm",
-                     "tenure_norm", "time_in_job_profile_norm", "age_norm",
-                     "genderMale")
-X_train_logit <- X_train[, vars_to_include]
-```
-
-Examine multicollinearity:
-```{r}
-cors <- cor(X_train_logit)
-melted_cors <- melt(cors)
-ggplot(melted_cors, mapping = aes(x = Var1, y = Var2, fill = value)) +
-  geom_tile() +
-  geom_text(aes(label = round(value, 2)), color = "black") +
-  scale_fill_gradient2(limits = c(-1, 1), 
-                       low = "#850000",
-                       mid = "white",
-                       high = "#e9aa03") +
-  theme(axis.text.x = element_text(angle = 15))
-```
-
-Highly positively correlated variables:
-Zone and position in range (0.87)
-Position in range and management level (0.51)
-Tenure and time in job profile (0.66)
-Tenure and age (0.63)
-
-Negatively correlated: 
-Management level and grade grouping (-0.65)
-Management level and reporting hierarchy level (-0.60)
-Grade grouping and position in range (-0.50)
-
-Take out management level, position in range, tenure (for now):
-
-```{r}
-X_train_logit <- select(X_train_logit,
-                        -tenure_norm,
-                        -management_level_encoded_norm,
-                        -position_in_range_norm)
-fit <- glm(y_train ~ ., 
-           data = cbind(X_train_logit, y_train),
-           family = "binomial",
-           weights = class_weights)
-# Save model:
-saveRDS(fit, "models/regressions/stat_logistic.rds")
-summary(fit)
+lambda = 0.005
+X_y <- get_X_y(data, cat_features, num_features)
+X <- X_y[[1]]
+y <- as.numeric(as.vector(X_y[[2]]))
+y_probs <- predict(cv_fit,
+                   s = lambda,
+                   newx = as.matrix(X),
+                   type = "response")
 ```
 
 ```{r}
-data %>%
-  group_by(number_of_direct_reports_norm > 0) %>%
-  summarize(count = n(), 
-            num_quit = sum(vol_attrition_next_year))
+mutate(data,
+       preds = y_probs[, 1],
+       rank = rank(preds, ties.method = "first"),
+       percentile = (rank - 1) / nrow(data) * 100,
+       percentile_bin = cut(percentile, c(0, 10, 20, 30, 40, 50,
+                                          60, 70, 80, 90, 100))) %>%
+  group_by(percentile_bin) %>%
+  summarize(year_end_count = n(),
+            num_exits = sum(vol_attrition_next_year),
+            percent_attrition = sum(vol_attrition_next_year) / year_end_count) %>%
+  arrange(desc(percentile_bin))
+```
+
+### Make predictions on 2023 file:
+
+```{r}
+lambda = 0.005
+cv_fit <- readRDS(here("one_year_predictions",
+                       "models",
+                       "regressions",
+                       "cv_model_v6.rds"))
+
+# Assign a value of 1 to voluntary attrition to avoid errors in data processing:
+df_2023 <- mutate(df, vol_attrition_next_year = 1)
+
+# Prepare all data before filtering because some variables are calculated based
+# on other years:
+# (ignore no non-missing arguments warning)
+data_2023 <- prepare_data_for_regression(
+  df_2023,
+  exclude_cols = c("cost_centre",
+                   "elt",
+                   "continent",
+                   "number_of_direct_reports_norm",
+                   "company",
+                   "management_level_encoded_norm",
+                   "potential_encoded_norm",
+                   "annual_review_encoded_norm",
+                   "zone_encoded_norm",
+                   "age_norm",
+                   "time_in_job_profile_norm",
+                   "tenure_norm",
+                   "age_over_tenure_norm",
+                   "reporting_hierarchy_level_norm",
+                   "rhl_squared_norm",
+                   "grade_grouping_encoded_norm"),
+  prediction_year = 2023
+)
+
+# Get numeric column names:
+num_features <- colnames(data_2023)[sapply(data_2023, is.numeric)]
+# Remove vol_attrition_next_year:
+num_features <- num_features[-length(num_features)]
+# Get categorical column names:
+cat_features <- names(data_2023)[sapply(data_2023, is.factor)]
+
+X_y_split <- get_X_y(data_2023, cat_features, num_features)
+X_2023 <- X_y_split[[1]]
+
+y_probs <- predict(cv_fit,
+                   s = lambda,
+                   newx = as.matrix(X_2023),
+                   type = "response")[, 1]
+
+predictions_2023 <- prepare_data(df_2023, prediction_year = 2023)
+predictions_2023$prediction <- y_probs
+
+remove_cols <- c("attrition", "vol_attrition", "vol_attrition_next_year",
+                 "year", "curr_annual_review", "prev_year_supervisor",
+                 "supervisor_change", "prev_job_family", "job_fam_change",
+                 "tenure_supervisor", "management_level_encoded",
+                 "zone_encoded", "grade_grouping_encoded",
+                 "annual_review_encoded", "potential_encoded", "continent")
+predictions_2023 <-
+  predictions_2023[, !colnames(predictions_2023) %in% remove_cols]
+write.csv(predictions_2023, here("one_year_predictions", "models",
+                                 "regressions", "lasso_v6_predictions.csv"))
 ```
 

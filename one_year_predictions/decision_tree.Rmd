@@ -1,7 +1,7 @@
 ---
 title: "One-Year Predictions: Decision Tree"
 output: html_document
-date: "2024-03-13"
+date: "2024-05-01"
 ---
 
 ```{r setup, include=FALSE}
@@ -14,19 +14,23 @@ library(tidyverse)
 library(caret)
 library(rpart.plot)
 library(ROCR)
+library(randomForest)
+library(here)
 source("../utils.R")
 set.seed(15)
 ```
 Load data:
 ```{r}
-df <- read_csv("../data/agg_one_year.csv")
+df <- read_csv(here("data", "agg_one_year.csv"))
 ```
 
 Data cleaning:
 ```{r}
-data <- prepare_data_for_DT(df, exclude_cols = c("country", "location",
-                                                 "cost_centre", "company",
-                                                 "elt"))
+data <- prepare_data_for_DT(df, exclude_cols = c("cost_centre", "company",
+                                                 "elt", "continent",
+                                                 "number_of_direct_reports",
+                                                 "potential", "annual_review",
+                                                 "management_level"))
 ```
 
 Split data into train, validation, and test sets:
@@ -35,6 +39,9 @@ split <- split_data(data)
 train_data <- split[[1]]
 validate_data <- split[[2]]
 test_data <- split[[3]]
+# Combine train data and validate data together (no need for 3 groups):
+train_data <- rbind(train_data, validate_data)
+
 # Implement class weights to account for biased dataset:
 class_weights <- ifelse(train_data$vol_attrition_next_year == "0",
                         1,
@@ -42,63 +49,44 @@ class_weights <- ifelse(train_data$vol_attrition_next_year == "0",
                           sum(train_data$vol_attrition_next_year == 1))
 ```
 
-Do univariate analysis to inform survival curves (delete this):
+
+**Train decision tree classifier using cross-validation:**
+
+Cross-validated model:
 ```{r}
-num_trees <- 10
-ctrl <- trainControl(method = "boot",
-                     number = num_trees)
-rpart_ctrl <- rpart.control(maxdepth = 4)
+# Define repeated sampling settings:
+nfolds <- 10
+ctrl <- trainControl(method = "cv",
+                     number = nfolds)
+# Train model (might take a while depending on settings):
 model <- train(
-  vol_attrition_next_year ~ position_in_range,
+  vol_attrition_next_year ~ .,
   data = train_data,
   method = "rpart",
   trControl = ctrl,
-  weights = class_weights,
-  control = rpart_ctrl
+  weights = class_weights
 )
-
-rpart.plot(model$finalModel)
-```
-
-
-**Train decision tree classifier using repeated sampling:**
-
-Bootstrapped and cross-validated model:
-```{r}
-# Define repeated sampling settings:
-num_trees <- 10
-ctrl <- trainControl(method = "boot",
-                     number = num_trees)
-# # Train model (might take a while depending on settings):
-# model <- train(
-#   vol_attrition_next_year ~ .,
-#   data = train_data,
-#   method = "rpart",
-#   trControl = ctrl,
-#   weights = class_weights
-# )
-# # Save the model:
-# saveRDS(model,
-#         file = "models/decision_trees/cv_model_noloc_nocomp_nocc_noelt.rds")
+# Save the model:
+saveRDS(model, file = "models/decision_trees/cv_model_v2.rds")
 # Load the model if it's already trained:
-model <- readRDS("models/decision_trees/cv_model_noloc_nocomp_nocc_noelt.rds")
-# model <- readRDS("models/decision_trees/fold10_model_noloc_nocomp_nocc.rds")
+model <- readRDS(here("one_year_predictions", "models", "decision_trees", "cv_model_v2.rds"))
 print(model)
 ```
 
 Evaluate model on validation set:
 ```{r}
 # Generate predictions from model:
-y_probs <- predict(model, newdata = validate_data, type = "prob")[, "1"]
-evaluate_class_model(y_probs, validate_data$vol_attrition_next_year)
+y_probs <- predict(model, newdata = test_data, type = "prob")[, "1"]
+evaluate_class_model(y_probs, test_data$vol_attrition_next_year,
+                     file_path = here("data_visualization", "plots", "dt_v2_roc.pdf"))
 ```
-For some reason, when I use 42 as a random seed and test the no elt model, I get much worse results. If I re-split the data or change the seed, this does not happen.
 
 Display the model:
 ```{r}
 rpart_model <- model$finalModel
 # Save the plot:
-pdf("models/decision_trees/cv_model_noloc_nocomp_nocc_noelt.pdf")
+pdf(here("one_year_predictions", "models", "deicision_trees",
+         "cv_model_v2.pdf"))
 rpart.plot(rpart_model)
 dev.off()
 ```
@@ -106,101 +94,48 @@ dev.off()
 Look at significant variables:
 ```{r}
 rpart_model <- model$finalModel
-rpart_model$variable.importance[1:30]
-```
-Check robustness of model to different years (need to fix this because the validation set does not have year in it):
-```{r}
-# conf_matrix <- confusionMatrix(predictions,
-#                                validate_data$vol_attrition_next_year)
-# for (curr_year in sort(unique(df$year))) {
-#   check_df <- filter(validate_data, year == curr_year)
-#   print(paste("Accuracy of model predictions for", year))
-#   predictions <- predict(model, newdata = check_df)
-#   conf_matrix <- confusionMatrix(predictions, check_df$vol_attrition_next_year)
-#   print(conf_matrix$overall['Accuracy'])
-# }
+rpart_model$variable.importance[1:20]
 ```
 
 ## Random forest:
 
-To run the random forest, we need to limit categorical features to a maximum of 53 categories. Those features are location, company, and cost centre. I will limit these to 50 categories:
+To run the random forest, we need to limit categorical features to a maximum of 53 categories. The remaining feature is location.
 
 ```{r}
-# group_low_counts <- function(data, col_names, max_levels = 50) {
-#   for (col in col_names) {
-#     # Count the frequency of each level
-#     freq <- table(data[[col]])
-#     # Check if the number of levels exceeds the maximum allowed
-#     if (length(freq) > max_levels) {
-#       # Identify the levels with the lowest counts
-#       low_counts_levels <- names(sort(freq)[1:(length(freq) - max_levels + 1)])
-#       # Replace these levels with "other"
-#       data[[col]] <- factor(ifelse(data[[col]] %in% low_counts_levels,
-#                                    "other",
-#                                    as.character(data[[col]])))
-#     }
-#   }
-#   return(data)
-# }
-
-data <- group_low_counts(df[c(features, "vol_attrition_next_year")],
-                         c("location", "company", "cost_centre"))
-# Split data into train (60%), validate (20%), and test data (20%):
-test_index <- createDataPartition(data$vol_attrition_next_year,
-                                  p = 0.2,
-                                  list = FALSE)
-test_data <- data[test_index, ]
-non_test_data <- data[-test_index, ]
-validate_index <- createDataPartition(non_test_data$vol_attrition_next_year,
-                                      p = 0.25,
-                                      list = FALSE)
-validate_data <- non_test_data[validate_index, ]
-train_data <- non_test_data[-validate_index, ]
-# Implement class weights to account for biased dataset:
-class_weights <- ifelse(train_data$vol_attrition_next_year == "0",
-                        1,
-                        sum(df$vol_attrition_next_year == "0") /
-                          sum(df$vol_attrition_next_year == "1"))
+set.seed(15)
+data <- select(data, !location)
+# Split data into train (80%) and test (20%) sets:
+split <- split_data(data)
+train_data <- split[[1]]
+validate_data <- split[[2]]
+test_data <- split[[3]]
+# Combine train data and validate data together (no need for 3 groups):
+train_data <- rbind(train_data, validate_data)
 ```
 
 Train RF model (takes a few minutes for 500 trees):
 ```{r}
-# # Train and save model:
-# rf_model <- randomForest(vol_attrition_next_year ~ .,
-#                          data = train_data,
-#                          # weights = class_weights,
-#                          classwt = c(0.0005, 2000),
-#                          ntree = 500)
-# saveRDS(rf_model, "models/decision_trees/rf_model_noloc_nocomp_nocc_noelt.rds")
+# Train and save model:
+rf_model <- randomForest(vol_attrition_next_year ~ .,
+                         data = train_data,
+                         classwt = c(1, 1),
+                         maxnodes = 30,
+                         ntree = 500)
+saveRDS(rf_model, here("one_year_predictions", "models", "rf_model_v2.rds"))
 # Load if the model has already been trained:
-rf_model <- readRDS("models/decision_trees/rf_model_noloc_nocomp_nocc_noelt.rds")
+rf_model <- readRDS(here("one_year_predictions", "models", "rf_model_v2.rds"))
 rf_model
 ```
 
 Predictions are on the x-axis in this case
 
-.0005, 2000
-.247, .352
-
-.001, 2000
-.116, .604
-
-.0001, 2000
-.581, .051
-
-.0005, 1500
-0.185, 0.449
-
-0.0005, 2500
-0.272, 0.293
-
 ```{r}
 # Predict probabilities for the validation data
 y_probs <- predict(rf_model, 
-                   newdata = validate_data, 
+                   newdata = test_data, 
                    type = "prob")
 
-evaluate_class_model(y_probs[, "1"], validate_data$vol_attrition_next_year)
+evaluate_class_model(y_probs[, "1"], test_data$vol_attrition_next_year)
 ```
 
 ```{r}
@@ -208,5 +143,3 @@ rf_imp <- as.data.frame(rf_model$importance)
 # rf_imp[order(foo$V1),]
 arrange(rf_imp, by = desc(MeanDecreaseGini))
 ```
-
-
