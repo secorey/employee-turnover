@@ -1,8 +1,10 @@
 ---
 title: "R Notebook"
 output: html_notebook
-date: "2024-03-18"
+date: "2024-05-01"
 ---
+
+Not going on the GitHub for now
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE)
@@ -15,34 +17,63 @@ library(caret)
 library(glmnet)
 library(survival)
 library(survminer)
-source("../utils.R")
+library(here)
+source(here("utils.R"))
 set.seed(42)
 ```
 
 Load data:
 ```{r}
-df <- read_csv("../data/agg_survival.csv")
+df <- read_csv(here("data", "agg_survival.csv"))
 ```
 
 Prepare data for analysis:
 ```{r}
-# Normalize and select relevant features:
-data <- prepare_data_for_regression(df, cox = TRUE)
-# Split into train, validation, and test sets:
+data <- prepare_data_for_regression(
+  df,
+  exclude_cols = c("cost_centre",
+                   "elt",
+                   "continent",
+                   "number_of_direct_reports_norm",
+                   "company",
+                   "management_level_encoded_norm",
+                   "potential_encoded_norm",
+                   "annual_review_encoded_norm",
+                   "zone_encoded_norm",
+                   "age_norm",
+                   "time_in_job_profile_norm",
+                   "tenure_norm",
+                   "age_over_tenure_norm",
+                   "reporting_hierarchy_level_norm",
+                   "rhl_squared_norm",
+                   "grade_grouping_encoded_norm"),
+  cox = TRUE
+)
+```
+
+Prepare data for model training:
+```{r}
+set.seed(42)
 split <- split_data(data)
 train_data <- split[[1]]
 validate_data <- split[[2]]
 test_data <- split[[3]]
+# Combine train data and validate data together (no need for 3 groups):
+train_data <- rbind(train_data, validate_data)
+```
 
+Get column names of numeric and categorical features:
+```{r}
+# Get numeric column names:
+num_features <- colnames(data)[sapply(data, is.numeric)]
+# Remove vol_attrition_next_year:
+num_features <- num_features[-length(num_features)]
+# Get categorical column names:
+cat_features <- names(data)[sapply(data, is.factor)]
+```
+
+```{r}
 # Encode categorical features and get X and y:
-cat_features <- c("job_family", "job_family_group", "country", "location",
-                  "ethnicity", "gender", "company", "elt")
-num_features <- c("is_active_union_member",
-                  "management_level_encoded_norm", "zone_encoded_norm",
-                  "grade_grouping_encoded_norm",
-                  "number_of_direct_and_indirect_reports_norm",
-                  "reporting_hierarchy_level_norm", "position_in_range_norm",
-                  "tenure_norm", "time_in_job_profile_norm", "age_norm")
 X_y_split <- get_X_y(train_data, cat_features, num_features, cox = TRUE)
 X_train <- X_y_split[[1]]
 y_train <- X_y_split[[2]]
@@ -50,24 +81,16 @@ y_train_surv <- Surv(as.numeric(y_train$time),
                      as.numeric(y_train$status))
 ```
 
-Train model (implement weights?):
-```{r}
-net_fit <- glmnet(X_train,
-                  y_train_surv,
-                  family = "cox")
-plot(net_fit, label = TRUE)
-```
-
 Train cross-validated model to get optimal value of $\lambda$ (takes a few minutes):
 ```{r}
-# cv_fit <- cv.glmnet(as.matrix(X_train),
-#                     y_train_surv,
-#                     family = "cox",
-#                     type.measure = "C")
-# # Save model:
-# saveRDS(cv_fit, "cv_model.rds")
+cv_fit <- cv.glmnet(as.matrix(X_train),
+                    y_train_surv,
+                    family = "cox",
+                    type.measure = "C")
+# Save model:
+saveRDS(cv_fit, here("survival_analysis", "cv_cox_model_v1.rds"))
 # Load model if already trained:
-cv_fit <- readRDS("cv_model.rds")
+cv_fit <- readRDS(here("survival_analysis", "cv_cox_model_v1.rds"))
 plot(cv_fit)
 ```
 
@@ -78,65 +101,21 @@ print(cv_fit$lambda.1se)
 ```
 
 ```{r}
-# lambda <- 0.009033023 # best lambda value from cross-validation
-# coefs_net_fit <- coef(net_fit, s = lambda)
-# # Arrange coefficients by descending size:
-# as.data.frame(as.matrix(coefs_net_fit)) %>% arrange(desc(abs(`1`)))
-# This should be the same as:
-coefs_cv_fit <- coef(cv_fit)
-as.data.frame(as.matrix(coefs_cv_fit)) %>% arrange(desc(abs(`1`)))
+lambda <- cv_fit$lambda.1se
+coefs <- coef(cv_fit, s = lambda)
+as.data.frame(as.matrix(coefs)) %>% arrange(desc(abs(`1`)))
 ```
 
 Evaluate performance on validate set:
 ```{r}
 # Split validation data into X and y:
-X_y_split <- get_X_y(validate_data, cat_features, num_features, cox = TRUE)
-X_validate <- X_y_split[[1]]
-y_validate <- X_y_split[[2]]
-y_validate_surv <- Surv(as.numeric(y_validate$time),
-                        as.numeric(y_validate$status))
+X_y_split <- get_X_y(test_data, cat_features, num_features, cox = TRUE)
+X_test <- X_y_split[[1]]
+y_test <- X_y_split[[2]]
+y_test_surv <- Surv(as.numeric(y_test$time),
+                        as.numeric(y_test$status))
 assess.glmnet(cv_fit,
-              newx = as.matrix(X_validate),
-              newy = y_validate_surv,
-              family = "cox")
-assess.glmnet(cv_fit,
-              newx = as.matrix(X_train),
-              newy = y_train_surv,
+              newx = as.matrix(X_test),
+              newy = y_test_surv,
               family = "cox")
 ```
-
-Get features from cv fit:
-```{r}
-
-```
-
-
-Check statistical significance for some variables:
-```{r}
-cox_model <- coxph(y_train_surv ~ tenure_norm + age_norm + position_in_range_norm,
-                   data = X_train)
-summary(cox_model)
-```
-
-Choose variables from lasso:
-```{r}
-
-```
-
-
-Check statistical significance of coefficients for fully saturated model (probably going to be overfit):
-```{r}
-cox_model_fullSat <- coxph(y_train_surv ~ .,
-                           data = X_train)
-sum_coxph_fullSat <- summary(cox_model_fullSat)
-```
-View most significant coefficients:
-```{r}
-as.data.frame(sum_coxph_fullSat$coefficients) %>% arrange(`Pr(>|z|)`) %>% View()
-```
-
-Assess performance:
-```{r}
-predicted_survival <- survfit(cox_model, newdata = X_validate)
-```
-
