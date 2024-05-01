@@ -11,15 +11,11 @@
 #    - attrition (1/0): whether the employee turned over (either voluntarily or
 #      involuntarily)
 #    - num_years: number of years until attrition or until the end of analysis
-# Notes:
-# - Filter out cases where there is a termination date but no term reason (might
-#   be next-day rehires)?
-
-# options(warn = -1)
 
 suppressMessages({
   library(tidyverse)
   library(readxl)
+  library(here)
 })
 
 read_file <- function(file_path) {
@@ -36,28 +32,34 @@ read_file <- function(file_path) {
     filter(is.na(`Next day rehire`),
            `Employment Status` == "Regular",
            Country != "Korea, Republic of",
-           (`Termination Reason` != "Voluntary: Retirement") | 
+           (`Termination Reason` != "Voluntary: Retirement") |
              (is.na(`Termination Reason`))) %>%
-    mutate(`As of Date` = 
+    mutate(`As of Date` =
              as.Date(as.numeric(`As of Date`), origin = "1899-12-30"),
-           `Termination Date` = 
+           `Termination Date` =
              as.Date(as.numeric(`Termination Date`), origin = "1899-12-30"),
            year = year(`As of Date`),
            vol_attrition = 
-             ifelse(!(`Termination Category` == 
-                        "Terminate Employee > Voluntary") |
-                      (is.na(`Termination Category`)), 0, 1),
+             ifelse((`Termination Category` == "Terminate Employee > Voluntary")
+                    & is.na(`Active Status`), 1, 0),
            attrition = ifelse(is.na(`Termination Category`), 0, 1),
            Tenure = as.numeric(ifelse(Tenure < 0, NA, Tenure)))
+  # Add column for current year annual review rating:
+  year <- df$year[1]
+  if (year <= 2022 & year >= 2019) {
+    df$curr_annual_review <- df[[paste(year, "Annual Review Rating")]]
+  } else {df$curr_annual_review <- NA}
+
   return(df)
 }
 
-df_2018 <- read_file("data/snapshots/EE Snapshot 2018.12.31.xlsx")
-df_2019 <- read_file("data/snapshots/EE Snapshot 2019.12.31.xlsx")
-df_2020 <- read_file("data/snapshots/EE Snapshot 2020.12.31.xlsx")
-df_2021 <- read_file("data/snapshots/EE Snapshot 2021.12.31.xlsx")
-df_2022 <- read_file("data/snapshots/EE Snapshot 2022.12.31.xlsx")
-df_2023 <- read_file("data/snapshots/EE Snapshot 2023.12.31.xlsx")
+base_path = here("data", "snapshots")
+df_2018 <- read_file(paste0(base_path, "/EE Snapshot 2018.12.31.xlsx"))
+df_2019 <- read_file(paste0(base_path, "/EE Snapshot 2019.12.31.xlsx"))
+df_2020 <- read_file(paste0(base_path, "/EE Snapshot 2020.12.31.xlsx"))
+df_2021 <- read_file(paste0(base_path, "/EE Snapshot 2021.12.31.xlsx"))
+df_2022 <- read_file(paste0(base_path, "/EE Snapshot 2022.12.31.xlsx"))
+df_2023 <- read_file(paste0(base_path, "/EE Snapshot 2023.12.31.xlsx"))
 
 # Combine data frames into one:
 df <- rbind(df_2018, df_2019, df_2020, df_2021, df_2022, df_2023)
@@ -70,10 +72,10 @@ df <- df %>%
   ungroup()
 
 # Export first file to CSV:
-write_csv(df, "data/agg_one_year.csv")
+write_csv(df, here("data", "agg_one_year.csv"))
 
 
-# Create second file:
+# Create survival analysis file:
 # For each iteration, in the old file, add 1 year to everyone who has not 
 # attrited. Then, in the new file, check for new employee IDs and add those rows 
 # with 0 for `num_years`. Then, check for all quits in the new file and change 
@@ -118,5 +120,3 @@ df_for_survival$`Active Status` <- ifelse(df_for_survival$attrition == 0,
                                           NA)
 
 write_csv(df_for_survival, "data/agg_survival.csv")
-
-# options(warn = 0)
