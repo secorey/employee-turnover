@@ -4,8 +4,6 @@ output: html_notebook
 date: "2024-05-01"
 ---
 
-Not going on the GitHub for now
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE)
 ```
